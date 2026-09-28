@@ -5,8 +5,19 @@ listeners, groups them into **Containers / Localhosts / Ports**, and lets you
 toggle which kinds appear. One QML panel serves the bar popup and
 brittiiaa.widgets desktop cards.
 
-Design notes from Codex: [`docs/codex-review.md`](docs/codex-review.md).
-Auto-discovery: [`docs/auto-discovery.md`](docs/auto-discovery.md).
+<p align="center">
+  <img src="docs/screenshots/01-panel.png" alt="Locals panel with CPU · MEM · PIDs under the accent meter" width="420">
+</p>
+
+More shots: [toolbar](docs/screenshots/02-toolbar.png) ·
+[bar glyph](docs/screenshots/03-bar.png) ·
+[desktop](docs/screenshots/04-desktop.png).
+
+Full guide: **[Wiki](https://github.com/wszaq/omarchy-locals/wiki)** —
+install, controls, autostart, config, and troubleshooting.
+
+Design notes: [`docs/codex-review.md`](docs/codex-review.md) ·
+auto-discovery: [`docs/auto-discovery.md`](docs/auto-discovery.md).
 
 ## Install
 
