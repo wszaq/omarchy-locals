@@ -545,6 +545,38 @@ class ProbeParseTests(unittest.TestCase):
         self.assertFalse(by_port[9090]["localhost"])  # LAN-only
         self.assertTrue(by_port[5173]["localhost"])
 
+    def test_list_listening_ports_prefers_localhost_pid(self):
+        """LAN bind first must not keep its PID when a localhost bind appears."""
+        ss_out = (
+            "State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n"
+            'LISTEN 0 128 192.168.1.5:3000 0.0.0.0:* users:(("lan-app",pid=111,fd=3))\n'
+            'LISTEN 0 128 127.0.0.1:3000 0.0.0.0:* users:(("node",pid=222,fd=18))\n'
+        )
+
+        def fake_run(argv, **kwargs):
+            return 0, ss_out, ""
+
+        result = probes.list_listening_ports(run=fake_run)
+        by_port = {L["port"]: L for L in result["listeners"]}
+        self.assertTrue(by_port[3000]["localhost"])
+        self.assertEqual(by_port[3000]["addr"], "127.0.0.1:3000")
+        self.assertEqual(by_port[3000]["comm"], "node")
+        self.assertEqual(by_port[3000]["pid"], 222)
+
+    def test_run_cmd_keeps_large_stdout(self):
+        big = ("x" * 5000) + "\n"
+
+        def fake_run(argv, **kwargs):
+            raise AssertionError("not used")
+
+        # Exercise _cap via run_cmd with a real echo of large data is heavy;
+        # unit-test the helper bound used by discovery.
+        self.assertGreater(probes.STDOUT_CAP, 4096)
+        kept = probes._cap(big * 2, probes.STDOUT_CAP)
+        self.assertGreater(len(kept), 4096)
+        small_err = probes._cap(big, probes.STDERR_CAP)
+        self.assertLessEqual(len(small_err), probes.STDERR_CAP)
+
     def test_list_docker_containers(self):
         lines = "\n".join(
             [

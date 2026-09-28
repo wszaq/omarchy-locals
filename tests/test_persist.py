@@ -52,6 +52,9 @@ class AutostartPersistTests(unittest.TestCase):
             self.assertIsNotNone(recipe)
             self.assertEqual(recipe["argv"], ["ollama", "serve"])
             self.assertEqual(recipe["cwd"], "/tmp")
+            path = persist.recipe_path_for("port:11434", recipes)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
 
     def test_annotate_adds_start_when_recipe(self):
         with tempfile.TemporaryDirectory() as tmp:

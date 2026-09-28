@@ -212,12 +212,13 @@ def collect_status(
         sort_mode=sort_mode,
     )
 
-    # Capture recipes for live controllable listeners (enables Start after reboot).
-    for row in status.get("targets") or []:
-        _capture_recipe_from_row(row)
-
+    # Refresh recipes only for ids already marked Start-on-login (not every listener).
     autostart_ids, auto_errs = persist.load_autostart()
     config_errors.extend(auto_errs)
+    marked = set(autostart_ids)
+    for row in status.get("targets") or []:
+        if row.get("id") in marked:
+            _capture_recipe_from_row(row)
     status["configErrors"] = list(config_errors)
     return persist.annotate_status_rows(status, autostart_ids=autostart_ids)
 

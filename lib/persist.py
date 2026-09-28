@@ -71,10 +71,20 @@ def save_autostart(ids: list[str], path: Path | None = None) -> tuple[bool, str]
         clean.append(t)
     payload = {"schemaVersion": SCHEMA_VERSION, "ids": clean}
     try:
-        p.parent.mkdir(parents=True, exist_ok=True)
+        p.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            os.chmod(p.parent, 0o700)
+        except OSError:
+            pass
         tmp = p.with_suffix(p.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        tmp.replace(p)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, indent=2) + "\n")
+        os.replace(tmp, p)
+        try:
+            os.chmod(p, 0o600)
+        except OSError:
+            pass
         return True, str(p)
     except OSError as exc:
         return False, str(exc)
@@ -154,10 +164,20 @@ def save_recipe(
         "capturedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            os.chmod(path.parent, 0o700)
+        except OSError:
+            pass
         tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        tmp.replace(path)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, indent=2) + "\n")
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
         return True, str(path)
     except OSError as exc:
         return False, str(exc)

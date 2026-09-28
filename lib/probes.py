@@ -11,8 +11,10 @@ import time
 from pathlib import Path
 from typing import Callable
 
+# stderr stays small (doctor/log); discovery stdout can be large (many containers / listeners).
 STDERR_CAP = 4096
-DEFAULT_TIMEOUT = 3.0
+STDOUT_CAP = 8 * 1024 * 1024
+DEFAULT_TIMEOUT = 8.0
 
 _SS_LISTEN_RE = re.compile(
     r"LISTEN\s+\S+\s+\S+\s+(\S+)\s+\S+(?:\s+users:\((.+)\))?"
@@ -49,6 +51,8 @@ def run_cmd(
     *,
     timeout: float = DEFAULT_TIMEOUT,
     env: dict | None = None,
+    stdout_cap: int = STDOUT_CAP,
+    stderr_cap: int = STDERR_CAP,
 ) -> tuple[int, str, str]:
     try:
         proc = subprocess.run(
@@ -58,11 +62,19 @@ def run_cmd(
             check=False,
             env=env,
         )
-        return proc.returncode, _cap(proc.stdout), _cap(proc.stderr)
+        return (
+            proc.returncode,
+            _cap(proc.stdout, stdout_cap),
+            _cap(proc.stderr, stderr_cap),
+        )
     except FileNotFoundError:
         return 127, "", f"not found: {argv[0]}"
     except subprocess.TimeoutExpired as exc:
-        return 124, _cap(exc.stdout), _cap(exc.stderr) or "timeout"
+        return (
+            124,
+            _cap(exc.stdout, stdout_cap),
+            _cap(exc.stderr, stderr_cap) or "timeout",
+        )
 
 
 def docker_reachable(run: Callable = run_cmd) -> bool:
@@ -211,7 +223,9 @@ def list_listening_ports(run: Callable = run_cmd) -> dict:
       ok, error,
       listeners: [{port, addr, comm, pid, docker_backed, localhost}],
     }
-    One record per port (first match wins); localhost flag marks loopback/wildcard.
+    One record per port. When both LAN and localhost bind the same port, keep the
+    localhost (or wildcard) bind's addr *and* its pid/comm so Stop cannot hit the
+    wrong process.
     """
     code, out, err = run(["ss", "-ltnp"], timeout=DEFAULT_TIMEOUT)
     if code != 0:
@@ -243,15 +257,28 @@ def list_listening_ports(run: Callable = run_cmd) -> dict:
                 "localhost": localhost,
             }
             continue
-        # Prefer a localhost bind representation; keep docker_backed if any bind is.
+        # Prefer a localhost bind; replace pid/comm with that bind's process.
         if localhost and not existing.get("localhost"):
             existing["addr"] = local
             existing["localhost"] = True
-        if docker_backed:
-            existing["docker_backed"] = True
-        if existing.get("comm") is None and comm:
             existing["comm"] = comm
             existing["pid"] = pid
+            existing["docker_backed"] = docker_backed or bool(existing.get("docker_backed"))
+            continue
+        # Already have localhost: ignore later LAN-only lines for identity.
+        if existing.get("localhost") and not localhost:
+            if docker_backed:
+                existing["docker_backed"] = True
+            continue
+        if docker_backed:
+            existing["docker_backed"] = True
+        if existing.get("pid") is None and pid is not None:
+            existing["comm"] = comm
+            existing["pid"] = pid
+        elif existing.get("comm") is None and comm:
+            existing["comm"] = comm
+            if existing.get("pid") is None:
+                existing["pid"] = pid
     return {"ok": True, "error": None, "listeners": list(by_port.values())}
 
 
