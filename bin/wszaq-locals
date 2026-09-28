@@ -1,0 +1,719 @@
+#!/usr/bin/env python3
+"""wszaq-locals — glanceable local docker/port status for Omarchy shell."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from lib import model, persist, probes  # noqa: E402
+
+
+def _load_config(path: Path) -> tuple[dict | None, str | None]:
+    """Load config. Missing file is plug-and-play (None, None)."""
+    if not path.exists():
+        return None, None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, f"config read error: {exc}"
+    return raw, None
+
+
+def _parse_bool(raw: str | None, default: bool) -> bool:
+    if raw is None:
+        return default
+    s = str(raw).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def filters_from_args(args: argparse.Namespace | None = None) -> dict:
+    defaults = model.DEFAULT_FILTERS
+    if args is None:
+        return dict(defaults)
+    return model.normalize_filters(
+        {
+            "showContainers": _parse_bool(
+                getattr(args, "show_containers", None), defaults["showContainers"]
+            ),
+            "showLocalhosts": _parse_bool(
+                getattr(args, "show_localhosts", None), defaults["showLocalhosts"]
+            ),
+            "showPorts": _parse_bool(
+                getattr(args, "show_ports", None), defaults["showPorts"]
+            ),
+        }
+    )
+
+
+def sort_mode_from_args(args: argparse.Namespace | None = None) -> str:
+    raw = getattr(args, "sort_mode", None) if args is not None else None
+    return model.normalize_sort_mode(raw)
+
+
+def _capture_recipe_from_row(row: dict) -> bool:
+    """Persist cmdline+cwd for a controllable host listener when possible."""
+    if row.get("kind") != "port":
+        return False
+    meta = row.get("meta") or {}
+    if meta.get("dockerBacked"):
+        return False
+    pid = meta.get("pid")
+    if pid is None:
+        return False
+    if not model.is_process_controllable(
+        comm=meta.get("comm"),
+        pid=pid,
+        docker_backed=False,
+    ):
+        return False
+    snap = probes.process_snapshot(pid)
+    argv = snap.get("argv")
+    cwd = snap.get("cwd")
+    if not argv or not cwd:
+        return False
+    ok, _ = persist.save_recipe(
+        str(row["id"]),
+        argv=argv,
+        cwd=cwd,
+        kind="port",
+        comm=meta.get("comm"),
+        port=meta.get("port") or row.get("port"),
+    )
+    return ok
+
+
+def collect_status(
+    config_path: Path | None = None,
+    *,
+    filters: dict | None = None,
+    sort_mode: str | None = None,
+) -> dict:
+    path = config_path or probes.default_config_path()
+    raw, read_err = _load_config(path)
+    config_errors: list[str] = []
+    if read_err:
+        # Unreadable/malformed config: still discover; report the error.
+        config_errors.append(read_err)
+        pinned: list[dict] = []
+        ignore_docker: set[str] = set()
+        ignore_ports: set[int] = set()
+    else:
+        pinned, ignore_docker, ignore_ports, config_errors = model.load_targets(raw)
+
+    reachable = probes.docker_reachable()
+    discovered_containers: list[dict] = []
+    discovery_by_name: dict[str, dict] = {}
+    if reachable:
+        listing = probes.list_docker_containers()
+        if listing["ok"]:
+            discovered_containers = listing["containers"]
+            discovery_by_name = {c["name"]: c for c in discovered_containers}
+        else:
+            # Daemon flickered after info — keep pinned probe path via inspect.
+            config_errors.append(f"docker ps: {listing.get('error') or 'failed'}")
+
+    port_listing = probes.list_listening_ports()
+    all_listeners = port_listing["listeners"] if port_listing["ok"] else []
+    if not port_listing["ok"]:
+        config_errors.append(f"ss: {port_listing.get('error') or 'failed'}")
+
+    # Auto-discover only localhost/wildcard binds (not LAN-only).
+    localhost_listeners = [L for L in all_listeners if L.get("localhost")]
+
+    targets = model.merge_targets(
+        pinned,
+        discovered_containers,
+        localhost_listeners,
+        ignore_docker=ignore_docker,
+        ignore_ports=ignore_ports,
+    )
+
+    docker_probes: dict[str, dict] = {}
+    port_probes: dict[str, dict] = {}
+    for t in targets:
+        if t["kind"] == "docker":
+            if not reachable:
+                docker_probes[t["id"]] = {"state": "unknown", "error": "docker unavailable"}
+            elif t["container"] in discovery_by_name:
+                docker_probes[t["id"]] = {
+                    "state": discovery_by_name[t["container"]]["state"],
+                    "error": None,
+                }
+            else:
+                # Pinned container absent from ps -a → inspect (missing → stopped).
+                docker_probes[t["id"]] = probes.probe_docker_container(t["container"])
+        elif t["kind"] == "port":
+            if not port_listing["ok"]:
+                port_probes[t["id"]] = {
+                    "listening": False,
+                    "error": port_listing.get("error") or "ss failed",
+                }
+            else:
+                port_probes[t["id"]] = probes.probe_port(
+                    t["port"], listeners=all_listeners
+                )
+
+    # Resource KPIs: one batched docker stats + /proc samples for host PIDs.
+    if reachable:
+        stats = probes.list_docker_stats()
+        if stats.get("ok"):
+            by_name = stats.get("by_name") or {}
+            for t in targets:
+                if t["kind"] != "docker":
+                    continue
+                res = by_name.get(t["container"])
+                if res and t["id"] in docker_probes:
+                    docker_probes[t["id"]]["resources"] = res
+        elif stats.get("error"):
+            # Soft: status still works; doctor may surface via empty resources.
+            pass
+
+    host_pids: list[int] = []
+    for tid, probe in port_probes.items():
+        pid = probe.get("pid")
+        if pid is None:
+            continue
+        try:
+            host_pids.append(int(pid))
+        except (TypeError, ValueError):
+            continue
+    if host_pids:
+        by_pid = probes.sample_pids_resources(host_pids)
+        for tid, probe in port_probes.items():
+            pid = probe.get("pid")
+            try:
+                pid_n = int(pid)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                continue
+            res = by_pid.get(pid_n)
+            if res:
+                probe["resources"] = res
+
+    status = model.build_status(
+        targets,
+        docker_reachable=reachable,
+        docker_probes=docker_probes,
+        port_probes=port_probes,
+        config_errors=config_errors,
+        config_path=str(path),
+        probed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        filters=filters,
+        sort_mode=sort_mode,
+    )
+
+    # Capture recipes for live controllable listeners (enables Start after reboot).
+    for row in status.get("targets") or []:
+        _capture_recipe_from_row(row)
+
+    autostart_ids, auto_errs = persist.load_autostart()
+    config_errors.extend(auto_errs)
+    status["configErrors"] = list(config_errors)
+    return persist.annotate_status_rows(status, autostart_ids=autostart_ids)
+
+
+def cmd_status(as_json: bool, filters: dict, sort_mode: str) -> int:
+    status = collect_status(filters=filters, sort_mode=sort_mode)
+    if as_json:
+        print(json.dumps(status, separators=(",", ":")))
+    else:
+        d = status["docker"]["reachable"]
+        c = status["counts"]
+        f = status.get("filters") or {}
+        print(f"docker={'up' if d else 'down'}  {c['running']}/{c['total']} running")
+        print(
+            "filters: "
+            f"containers={f.get('showContainers')} "
+            f"localhosts={f.get('showLocalhosts')} "
+            f"ports={f.get('showPorts')}  "
+            f"sort={status.get('sortMode')}"
+        )
+        for err in status.get("configErrors") or []:
+            print(f"config: {err}", file=sys.stderr)
+        groups = status.get("groups") or {}
+        for section, key in (
+            ("Containers", "containers"),
+            ("Localhosts", "localhosts"),
+            ("Ports", "ports"),
+        ):
+            rows = groups.get(key) or []
+            if not rows:
+                continue
+            print(f"  [{section}]")
+            for t in rows:
+                act = ",".join(t.get("actions") or []) or "-"
+                err = f"  err={t['error']}" if t.get("error") else ""
+                disc = " *" if t.get("discovered") else ""
+                res = t.get("resources") or {}
+                kpi = ""
+                if res:
+                    kpi = (
+                        f"  cpu={res.get('cpu')} mem={res.get('mem')} "
+                        f"{res.get('thirdLabel', 'PIDs')}={res.get('third')}"
+                    )
+                print(f"    {t['id']:24} {t['state']:8} [{act}]{disc}{err}{kpi}")
+    return 0
+
+
+def cmd_doctor(filters: dict, sort_mode: str) -> int:
+    path = probes.default_config_path()
+    state = probes.default_state_dir()
+    print(f"config: {path}  exists={path.exists()}")
+    print(f"state:  {state}  exists={state.exists()}")
+    sock = Path("/var/run/docker.sock")
+    print(f"docker.sock: {sock}  exists={sock.exists()}")
+    reachable = probes.docker_reachable()
+    print(f"docker reachable: {reachable}")
+    code, _out, err = probes.run_cmd(["ss", "-ltnp"], timeout=3.0)
+    print(f"ss: exit={code} stderr={err or '-'}")
+    status = collect_status(path, filters=filters, sort_mode=sort_mode)
+    f = status.get("filters") or {}
+    print(
+        f"filters: containers={f.get('showContainers')} "
+        f"localhosts={f.get('showLocalhosts')} ports={f.get('showPorts')} "
+        f"sort={status.get('sortMode')}"
+    )
+    print(f"targets: {status['counts']['total']}  running={status['counts']['running']}")
+    groups = status.get("groups") or {}
+    print(
+        "groups: "
+        f"containers={len(groups.get('containers') or [])} "
+        f"localhosts={len(groups.get('localhosts') or [])} "
+        f"ports={len(groups.get('ports') or [])}"
+    )
+    for e in status.get("configErrors") or []:
+        print(f"config error: {e}")
+    for t in status["targets"]:
+        disc = "discovered" if t.get("discovered") else "pinned"
+        res = t.get("resources") or {}
+        kpi = ""
+        if res:
+            kpi = (
+                f" resources=cpu:{res.get('cpu')} mem:{res.get('mem')} "
+                f"{res.get('thirdLabel', 'PIDs')}:{res.get('third')}"
+            )
+        print(
+            f"  {t['id']} kind={t['kind']} group={t.get('group')} "
+            f"state={t['state']} actions={t['actions']} ({disc}){kpi}"
+        )
+    if not path.exists():
+        print("hint: optional pins/ignore in ~/.config/omarchy/locals/targets.json")
+    # Fail only on hard probe breakage (ss). Missing config is OK (plug-and-play).
+    if code != 0:
+        return 1
+    if any(e.startswith("config read error:") for e in (status.get("configErrors") or [])):
+        return 1
+    return 0
+
+
+def cmd_action(action: str, target_id: str) -> int:
+    path = probes.default_config_path()
+    status = collect_status(path, filters={"showContainers": True, "showLocalhosts": True, "showPorts": True})
+    row = next((t for t in status["targets"] if t["id"] == target_id), None)
+    log_path = probes.default_state_dir() / "log.jsonl"
+    if row is None:
+        probes.append_log(
+            log_path,
+            {"action": action, "id": target_id, "ok": False, "error": "unknown target"},
+        )
+        print(json.dumps({"ok": False, "error": "unknown target", "id": target_id}))
+        return 1
+    if not model.action_allowed(row, action):
+        err = f"action {action!r} not allowed for state {row['state']!r}"
+        probes.append_log(
+            log_path,
+            {"action": action, "id": target_id, "ok": False, "error": err, "state": row["state"]},
+        )
+        print(json.dumps({"ok": False, "error": err, "id": target_id, "state": row["state"]}))
+        return 1
+
+    kind = row.get("kind")
+    meta = row.get("meta") or {}
+
+    if kind == "docker":
+        if not status["docker"]["reachable"]:
+            err = "docker unavailable"
+            probes.append_log(log_path, {"action": action, "id": target_id, "ok": False, "error": err})
+            print(json.dumps({"ok": False, "error": err, "id": target_id}))
+            return 1
+        container = meta.get("container")
+        if not container:
+            err = "missing container name"
+            probes.append_log(log_path, {"action": action, "id": target_id, "ok": False, "error": err})
+            print(json.dumps({"ok": False, "error": err, "id": target_id}))
+            return 1
+        ok, detail = probes.docker_action(str(container), action)
+        probes.append_log(
+            log_path,
+            {
+                "action": action,
+                "id": target_id,
+                "container": container,
+                "ok": ok,
+                "detail": detail,
+                "priorState": row["state"],
+            },
+        )
+        print(json.dumps({"ok": ok, "id": target_id, "action": action, "detail": detail}))
+        return 0 if ok else 1
+
+    if kind == "port":
+        if meta.get("dockerBacked"):
+            err = "docker-proxy ports are controlled via the container row"
+            probes.append_log(log_path, {"action": action, "id": target_id, "ok": False, "error": err})
+            print(json.dumps({"ok": False, "error": err, "id": target_id}))
+            return 1
+
+        # Start from saved recipe (after stop / reboot) — no live pid required.
+        if action == "start":
+            recipe = persist.load_recipe(target_id)
+            if not recipe:
+                err = "no start recipe for this listener"
+                probes.append_log(log_path, {"action": action, "id": target_id, "ok": False, "error": err})
+                print(json.dumps({"ok": False, "error": err, "id": target_id}))
+                return 1
+            ok, detail = probes.start_from_recipe(recipe["argv"], recipe["cwd"])
+            probes.append_log(
+                log_path,
+                {
+                    "action": action,
+                    "id": target_id,
+                    "ok": ok,
+                    "detail": detail,
+                    "priorState": row["state"],
+                    "recipe": True,
+                },
+            )
+            print(json.dumps({"ok": ok, "id": target_id, "action": action, "detail": detail}))
+            return 0 if ok else 1
+
+        if not model.is_process_controllable(
+            comm=meta.get("comm"),
+            pid=meta.get("pid"),
+            docker_backed=bool(meta.get("dockerBacked")),
+        ):
+            err = "process not controllable"
+            probes.append_log(log_path, {"action": action, "id": target_id, "ok": False, "error": err})
+            print(json.dumps({"ok": False, "error": err, "id": target_id}))
+            return 1
+        # Capture recipe before stop/restart so Start still works later.
+        if action in ("stop", "restart", "pause"):
+            _capture_recipe_from_row(row)
+        pid = meta.get("pid")
+        ok, detail = probes.process_action(int(pid), action)
+        probes.append_log(
+            log_path,
+            {
+                "action": action,
+                "id": target_id,
+                "pid": pid,
+                "comm": meta.get("comm"),
+                "ok": ok,
+                "detail": detail,
+                "priorState": row["state"],
+            },
+        )
+        print(json.dumps({"ok": ok, "id": target_id, "action": action, "detail": detail, "pid": pid}))
+        return 0 if ok else 1
+
+    err = f"unsupported kind {kind!r}"
+    probes.append_log(log_path, {"action": action, "id": target_id, "ok": False, "error": err})
+    print(json.dumps({"ok": False, "error": err, "id": target_id}))
+    return 1
+
+
+def cmd_autostart_set(target_id: str, enabled: bool) -> int:
+    """Toggle Start on login for a target id."""
+    status = collect_status(
+        filters={"showContainers": True, "showLocalhosts": True, "showPorts": True}
+    )
+    row = next((t for t in status["targets"] if t["id"] == target_id), None)
+    log_path = probes.default_state_dir() / "log.jsonl"
+    if row is None:
+        print(json.dumps({"ok": False, "error": "unknown target", "id": target_id}))
+        return 1
+    if enabled and not row.get("canAutostart"):
+        err = "cannot Start on login without a docker name or start recipe"
+        probes.append_log(
+            log_path,
+            {"action": "autostart-set", "id": target_id, "ok": False, "error": err},
+        )
+        print(json.dumps({"ok": False, "error": err, "id": target_id, "canAutostart": False}))
+        return 1
+    if enabled and row.get("kind") == "port":
+        _capture_recipe_from_row(row)
+        if not persist.load_recipe(target_id) and not row.get("hasRecipe"):
+            # Still allow if can_restart just captured; else refuse.
+            if not persist.load_recipe(target_id):
+                err = "capture a recipe first (process must be running once)"
+                print(json.dumps({"ok": False, "error": err, "id": target_id}))
+                return 1
+    ok, result = persist.set_autostart(target_id, enabled)
+    probes.append_log(
+        log_path,
+        {"action": "autostart-set", "id": target_id, "enabled": enabled, **result},
+    )
+    print(json.dumps(result))
+    return 0 if ok else 1
+
+
+def cmd_autostart(*, dry_run: bool = False) -> int:
+    """Start every marked autostart target (docker start / recipe spawn)."""
+    ids, errors = persist.load_autostart()
+    log_path = probes.default_state_dir() / "log.jsonl"
+    results: list[dict] = []
+    if errors:
+        for e in errors:
+            results.append({"ok": False, "error": e})
+
+    status = collect_status(
+        filters={"showContainers": True, "showLocalhosts": True, "showPorts": True}
+    )
+    by_id = {t["id"]: t for t in status.get("targets") or []}
+
+    for tid in ids:
+        row = by_id.get(tid)
+        entry: dict = {"id": tid, "ok": False}
+        if row is None:
+            # Still try docker:name / port:N from id alone.
+            if tid.startswith("docker:"):
+                name = tid.split(":", 1)[1]
+                entry["kind"] = "docker"
+                entry["plan"] = f"docker start {name}"
+                if dry_run:
+                    entry["ok"] = True
+                    entry["dryRun"] = True
+                else:
+                    ok, detail = probes.docker_start_with_retry(name)
+                    entry["ok"] = ok
+                    entry["detail"] = detail
+            elif tid.startswith("port:"):
+                recipe = persist.load_recipe(tid)
+                entry["kind"] = "port"
+                if not recipe:
+                    entry["error"] = "unknown target and no recipe"
+                else:
+                    entry["plan"] = f"exec {recipe['argv']!r} in {recipe['cwd']}"
+                    if dry_run:
+                        entry["ok"] = True
+                        entry["dryRun"] = True
+                    else:
+                        ok, detail = probes.start_from_recipe(recipe["argv"], recipe["cwd"])
+                        entry["ok"] = ok
+                        entry["detail"] = detail
+            else:
+                entry["error"] = "unknown target"
+            results.append(entry)
+            probes.append_log(log_path, {"action": "autostart", **entry})
+            continue
+
+        kind = row.get("kind")
+        entry["kind"] = kind
+        state = row.get("state")
+        if state in ("running", "paused"):
+            entry["ok"] = True
+            entry["detail"] = f"already {state}"
+            if dry_run:
+                entry["dryRun"] = True
+            results.append(entry)
+            probes.append_log(log_path, {"action": "autostart", **entry})
+            continue
+
+        if kind == "docker":
+            name = (row.get("meta") or {}).get("container")
+            entry["plan"] = f"docker start {name}"
+            if dry_run:
+                entry["ok"] = True
+                entry["dryRun"] = True
+            else:
+                ok, detail = probes.docker_start_with_retry(str(name))
+                entry["ok"] = ok
+                entry["detail"] = detail
+        elif kind == "port":
+            recipe = persist.load_recipe(tid)
+            if not recipe:
+                entry["error"] = "no start recipe"
+            else:
+                entry["plan"] = f"exec {recipe['argv']!r} in {recipe['cwd']}"
+                if dry_run:
+                    entry["ok"] = True
+                    entry["dryRun"] = True
+                else:
+                    ok, detail = probes.start_from_recipe(recipe["argv"], recipe["cwd"])
+                    entry["ok"] = ok
+                    entry["detail"] = detail
+        else:
+            entry["error"] = f"unsupported kind {kind!r}"
+        results.append(entry)
+        probes.append_log(log_path, {"action": "autostart", **entry})
+
+    payload = {
+        "ok": True,
+        "dryRun": dry_run,
+        "path": str(persist.default_autostart_path()),
+        "ids": ids,
+        "results": results,
+    }
+    print(json.dumps(payload, indent=2 if dry_run else None, separators=None if dry_run else (",", ":")))
+    # Always exit 0 — per-id failures are in results (login hook must not fail the session).
+    return 0
+
+
+def cmd_ignore(target_id: str) -> int:
+    """Append docker:<name> or port:N to targets.json ignore list."""
+    path = probes.default_config_path()
+    # Look up against unfiltered discovery so Ignore works even when Ports is off.
+    status = collect_status(
+        path,
+        filters={"showContainers": True, "showLocalhosts": True, "showPorts": True},
+    )
+    row = next((t for t in status["targets"] if t["id"] == target_id), None)
+    log_path = probes.default_state_dir() / "log.jsonl"
+    if row is None:
+        probes.append_log(
+            log_path,
+            {"action": "ignore", "id": target_id, "ok": False, "error": "unknown target"},
+        )
+        print(json.dumps({"ok": False, "error": "unknown target", "id": target_id}))
+        return 1
+    token = model.ignore_token_for(row)
+    if not token:
+        err = "cannot ignore this target"
+        probes.append_log(
+            log_path, {"action": "ignore", "id": target_id, "ok": False, "error": err}
+        )
+        print(json.dumps({"ok": False, "error": err, "id": target_id}))
+        return 1
+
+    raw, read_err = _load_config(path)
+    if read_err:
+        probes.append_log(
+            log_path,
+            {"action": "ignore", "id": target_id, "ok": False, "error": read_err},
+        )
+        print(json.dumps({"ok": False, "error": read_err, "id": target_id}))
+        return 1
+    cfg = raw if isinstance(raw, dict) else {}
+    ignore = list(cfg.get("ignore") or [])
+    # Deduplicate by normalized token forms.
+    existing_docker, existing_ports, _ = model.parse_ignore(ignore)
+    if token.startswith("docker:"):
+        name = token.split(":", 1)[1]
+        if name in existing_docker:
+            print(json.dumps({"ok": True, "id": target_id, "ignore": token, "already": True}))
+            return 0
+    elif token.startswith("port:"):
+        try:
+            port_n = int(token.split(":", 1)[1])
+        except ValueError:
+            port_n = -1
+        if port_n in existing_ports:
+            print(json.dumps({"ok": True, "id": target_id, "ignore": token, "already": True}))
+            return 0
+    ignore.append(token)
+    cfg["ignore"] = ignore
+    if "targets" not in cfg:
+        cfg["targets"] = []
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(path)
+    except OSError as exc:
+        err = f"write failed: {exc}"
+        probes.append_log(
+            log_path, {"action": "ignore", "id": target_id, "ok": False, "error": err}
+        )
+        print(json.dumps({"ok": False, "error": err, "id": target_id}))
+        return 1
+    probes.append_log(
+        log_path, {"action": "ignore", "id": target_id, "ok": True, "ignore": token}
+    )
+    print(json.dumps({"ok": True, "id": target_id, "ignore": token, "configPath": str(path)}))
+    return 0
+
+
+def _add_filter_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--show-containers",
+        default=None,
+        help="1/0 — include Containers in counts (default on)",
+    )
+    parser.add_argument(
+        "--show-localhosts",
+        default=None,
+        help="1/0 — include Localhosts in counts (default on)",
+    )
+    parser.add_argument(
+        "--show-ports",
+        default=None,
+        help="1/0 — include Ports in counts (default off)",
+    )
+    parser.add_argument(
+        "--sort-mode",
+        default=None,
+        help="default | az | port — row order inside each group",
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="wszaq-locals")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_status = sub.add_parser("status", help="Show target status")
+    p_status.add_argument("--json", action="store_true")
+    _add_filter_flags(p_status)
+
+    p_doctor = sub.add_parser("doctor", help="Diagnose config and probes")
+    _add_filter_flags(p_doctor)
+
+    for name in ("start", "stop", "pause", "resume", "restart"):
+        p = sub.add_parser(name, help=f"{name} a target")
+        p.add_argument("id")
+
+    p_ignore = sub.add_parser("ignore", help="Append target to targets.json ignore list")
+    p_ignore.add_argument("id")
+
+    p_auto = sub.add_parser(
+        "autostart",
+        help="Start marked targets after login (docker start / saved recipes)",
+    )
+    p_auto.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print what would start without spawning anything",
+    )
+
+    p_auto_on = sub.add_parser("autostart-on", help="Mark target Start on login")
+    p_auto_on.add_argument("id")
+    p_auto_off = sub.add_parser("autostart-off", help="Unmark target Start on login")
+    p_auto_off.add_argument("id")
+
+    args = parser.parse_args(argv)
+    if args.cmd == "status":
+        return cmd_status(args.json, filters_from_args(args), sort_mode_from_args(args))
+    if args.cmd == "doctor":
+        return cmd_doctor(filters_from_args(args), sort_mode_from_args(args))
+    if args.cmd == "ignore":
+        return cmd_ignore(args.id)
+    if args.cmd == "autostart":
+        return cmd_autostart(dry_run=bool(args.dry_run))
+    if args.cmd == "autostart-on":
+        return cmd_autostart_set(args.id, True)
+    if args.cmd == "autostart-off":
+        return cmd_autostart_set(args.id, False)
+    return cmd_action(args.cmd, args.id)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

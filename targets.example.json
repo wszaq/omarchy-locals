@@ -1,0 +1,18 @@
+{
+  "ignore": ["port:53"],
+  "targets": [
+    {
+      "id": "example-port",
+      "kind": "port",
+      "label": "Example port",
+      "port": 8080,
+      "url": "http://127.0.0.1:8080"
+    },
+    {
+      "id": "example-docker",
+      "kind": "docker",
+      "label": "Example container",
+      "container": "example"
+    }
+  ]
+}

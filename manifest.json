@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "id": "wszaq.locals",
+  "name": "Local services",
+  "version": "0.2.1",
+  "author": "wszaq",
+  "license": "MIT",
+  "repository": "https://github.com/wszaq/omarchy-locals",
+  "description": "Auto-discovers Docker containers and localhost listeners, grouped as Containers / Localhosts / Ports with on/off filters.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Locals",
+    "description": "Grouped Docker + localhost ports with kind toggles (Ports off by default).",
+    "category": "System",
+    "aliases": ["locals", "docker", "ports"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "pollIntervalSec": 5,
+      "showContainers": true,
+      "showLocalhosts": true,
+      "showPorts": false,
+      "sortMode": "default"
+    },
+    "schema": [
+      {
+        "key": "pollIntervalSec",
+        "type": "integer",
+        "label": "Poll interval (seconds)",
+        "min": 2,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 5
+      },
+      {
+        "key": "showContainers",
+        "type": "boolean",
+        "label": "Show containers",
+        "defaultValue": true
+      },
+      {
+        "key": "showLocalhosts",
+        "type": "boolean",
+        "label": "Show localhosts",
+        "defaultValue": true
+      },
+      {
+        "key": "showPorts",
+        "type": "boolean",
+        "label": "Show other ports",
+        "defaultValue": false
+      },
+      {
+        "key": "sortMode",
+        "type": "string",
+        "label": "Sort mode",
+        "defaultValue": "default",
+        "enum": ["default", "az", "port"]
+      }
+    ]
+  }
+}

@@ -1,0 +1,17 @@
+[Unit]
+Description=wszaq.locals — restore Start-on-login containers and localhost apps
+Documentation=file://%h/.config/omarchy/plugins/wszaq.locals/README.md
+After=default.target
+# Soft dependency: if docker.service exists for the user/system, wait a bit.
+Wants=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.config/omarchy/plugins/wszaq.locals/bin/wszaq-locals autostart
+# Give docker a moment on cold boot if the unit races the daemon.
+ExecStartPre=/bin/sleep 3
+Nice=10
+
+[Install]
+WantedBy=default.target

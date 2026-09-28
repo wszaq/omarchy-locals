@@ -1,0 +1,10 @@
+Replace `barText()` with:
+
+```qml
+function barText() {
+  var glyph = hasError ? "󰀦" : "󰡰" // U+F0870, md-docker
+  return running > 0 ? glyph + " " + Math.min(running, 9) : glyph
+}
+```
+
+Leave `BarIconButton` as it is. The spacing follows **omascribe.control’s `BarIconButton`**: one ASCII space between the glyph and a suffix, with the default slot and font sizes. At zero, only the glyph appears. Counts above 9 display as `9`.

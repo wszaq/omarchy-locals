@@ -1,0 +1,33 @@
+**Identification:** `wszaq.locals` is the monitor and folder glyph immediately before `0/0`. The plain monitor after `0/0` is `omarchy.monitor`.
+
+**Why it blends:** The two glyphs use a similar monitor shape, size, weight, and color. The nearby bar icons use the same visual style.
+
+**Recommended glyph:** `L` (U+004C, Latin capital letter L). It reads as “locals” without another monitor shape.
+
+**Exact QML change:**
+
+```diff
+   function barText() {
+-    var glyph = hasError ? "󰀦" : "󰡰"
++    var glyph = hasError ? "󰀦" : "L"
+     return glyph + " " + running + "/" + total
+   }
+```
+
+```diff
+   BarIconButton {
+     id: button
+     anchors.fill: parent
+     bar: root.bar
+     text: root.barText()
++    foreground: root.hasError ? Color.urgent : Color.bar.text
+     tooltipText: root.barTooltip()
+     opacity: root.running === 0 && root.total > 0 ? 0.55 : 1.0
+     onPressed: function(b) {
+       if (b === Qt.RightButton) root.launchDockerTui()
+       else root.toggle()
+     }
+   }
+```
+
+**Rationale:** `L 0/0` has a clear shape beside the monitor icon, while theme colors keep the normal label readable and mark errors as warnings.
