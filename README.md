@@ -13,8 +13,7 @@ More shots: [toolbar](docs/screenshots/02-toolbar.png) ·
 [bar glyph](docs/screenshots/03-bar.png) ·
 [desktop](docs/screenshots/04-desktop.png).
 
-Full guide: **[Wiki](https://github.com/wszaq/omarchy-locals/wiki)** —
-install, controls, autostart, config, and troubleshooting.
+Full guide: **[Wiki](docs/wiki/Home.md)** (Install, Controls, Autostart, Configuration, Screenshots, Troubleshooting).
 
 Design notes: [`docs/codex-review.md`](docs/codex-review.md) ·
 auto-discovery: [`docs/auto-discovery.md`](docs/auto-discovery.md).

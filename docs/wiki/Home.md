@@ -6,12 +6,12 @@ Omarchy bar widget that **auto-discovers** Docker containers and localhost liste
 
 ## Pages
 
-- [[Install]]
-- [[Controls]]
-- [[Autostart]]
-- [[Configuration]]
-- [[Screenshots]]
-- [[Troubleshooting]]
+- [Install](Install.md)
+- [Controls](Controls.md)
+- [Autostart](Autostart.md)
+- [Configuration](Configuration.md)
+- [Screenshots](Screenshots.md)
+- [Troubleshooting](Troubleshooting.md)
 
 ## Quick install
 
