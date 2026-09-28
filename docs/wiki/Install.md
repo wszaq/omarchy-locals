@@ -25,7 +25,7 @@ In the Widgets editor (brittiiaa.widgets), enable `wszaq.locals` as a 2×2 card,
 ~/.config/omarchy/plugins/wszaq.locals/systemd/install-autostart.sh install
 ```
 
-See [[Autostart]].
+See [Autostart](Autostart.md).
 
 ## Uninstall
 
