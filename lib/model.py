@@ -261,7 +261,7 @@ def guess_http_url(port: int, comm: str | None = None) -> str | None:
         port_n = int(port)
     except (TypeError, ValueError):
         return None
-    comm_l = (comm or "").strip().lower()
+    comm_l = (comm or "").strip().lower().removesuffix("-mainthread")
     if port_n not in HTTPISH_PORTS and comm_l not in HTTPISH_COMMS:
         return None
     scheme = "https" if port_n in (443, 8443) else "http"
@@ -282,7 +282,8 @@ def port_in_localhost_ranges(port: int) -> bool:
 
 
 def is_localhost_comm(comm: str | None) -> bool:
-    return (comm or "").strip().lower() in LOCALHOST_COMMS
+    # Node names its main thread "node-MainThread"; ss shows that as the comm.
+    return (comm or "").strip().lower().removesuffix("-mainthread") in LOCALHOST_COMMS
 
 
 def classify_group(

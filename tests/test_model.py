@@ -201,6 +201,10 @@ class ClassifyGroupTests(unittest.TestCase):
             model.classify_group(kind="port", port=5173, comm="node", discovered=True),
             "localhost",
         )
+        self.assertEqual(
+            model.classify_group(kind="port", port=4640, comm="node-MainThread", discovered=True),
+            "localhost",
+        )
 
     def test_noise_ports(self):
         self.assertEqual(
